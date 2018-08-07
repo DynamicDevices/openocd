@@ -49,17 +49,21 @@
 
 #define FLASH_ERASE_TIMEOUT 250
 
-#define STM32_FLASH_BASE    0x40022000
-#define STM32_FLASH_ACR     0x40022000
-#define STM32_FLASH_KEYR    0x40022008
-#define STM32_FLASH_OPTKEYR 0x4002200c
-#define STM32_FLASH_SR      0x40022010
-#define STM32_FLASH_CR      0x40022014
-#define STM32_FLASH_OPTR    0x40022020
-#define STM32_FLASH_WRP1AR  0x4002202c
-#define STM32_FLASH_WRP2AR  0x40022030
-#define STM32_FLASH_WRP1BR  0x4002204c
-#define STM32_FLASH_WRP2BR  0x40022050
+#define STM32_FLASH_BASE     0x40022000
+#define STM32_FLASH_ACR      0x40022000
+#define STM32_FLASH_KEYR     0x40022008
+#define STM32_FLASH_OPTKEYR  0x4002200c
+#define STM32_FLASH_SR       0x40022010
+#define STM32_FLASH_CR       0x40022014
+#define STM32_FLASH_OPTR     0x40022020
+#define STM32_FLASH_PCROP1SR 0x40022024
+#define STM32_FLASH_PCROP1ER 0x40022028
+#define STM32_FLASH_WRP1AR   0x4002202c
+#define STM32_FLASH_WRP1BR   0x40022030
+#define STM32_FLASH_PCROP2SR 0x40022044
+#define STM32_FLASH_PCROP2ER 0x40022048
+#define STM32_FLASH_WRP2AR   0x4002204c
+#define STM32_FLASH_WRP2BR   0x40022050
 
 /* FLASH_CR register bits */
 
@@ -70,8 +74,10 @@
 #define FLASH_CR_BKER  (1 << 11)
 #define FLASH_MER2     (1 << 15)
 #define FLASH_STRT     (1 << 16)
+#define FLASH_OPTSTRT  (1 << 17)
 #define FLASH_EOPIE    (1 << 24)
 #define FLASH_ERRIE    (1 << 25)
+#define FLASH_OBLLAUNCH (1 << 27)
 #define FLASH_OPTLOCK  (1 << 30)
 #define FLASH_LOCK     (1 << 31)
 
@@ -88,6 +94,9 @@
 #define FLASH_EOP      (1 << 0) /* End of operation */
 
 #define FLASH_ERROR (FLASH_PGSERR | FLASH_PGSERR | FLASH_PGAERR | FLASH_WRPERR | FLASH_OPERR)
+
+/* STM32_FLASH_PCROP1ER register bits */
+#define PCROP_RDP      (1 << 31) /* Perform mass erase when going from RDP1->RDP0 */
 
 /* STM32_FLASH_OBR bit definitions (reading) */
 
@@ -110,7 +119,11 @@
 struct stm32l4_options {
 	uint8_t RDP;
 	uint16_t bank_b_start;
-	uint8_t user_options;
+	uint32_t user_options;
+        uint32_t pcrop1_start;
+        uint32_t pcrop1_end;
+        uint32_t pcrop2_start;
+        uint32_t pcrop2_end;
 	uint8_t wpr1a_start;
 	uint8_t wpr1a_end;
 	uint8_t wpr1b_start;
@@ -198,6 +211,28 @@ static int stm32l4_wait_status_busy(struct flash_bank *bank, int timeout)
 	return retval;
 }
 
+#if 0
+static int stm32l4_lock_reg(struct target *target)
+{
+	uint32_t ctrl;
+
+	int retval = target_read_u32(target, STM32_FLASH_CR, &ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if ((ctrl & FLASH_LOCK) == (uint32_t)FLASH_LOCK)
+		return ERROR_OK;
+
+	/* lock flash registers */
+	ctrl |= FLASH_LOCK;
+	retval = target_write_u32(target, STM32_FLASH_CR, ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	return ERROR_OK;
+}
+#endif
+
 static int stm32l4_unlock_reg(struct target *target)
 {
 	uint32_t ctrl;
@@ -232,6 +267,28 @@ static int stm32l4_unlock_reg(struct target *target)
 
 	return ERROR_OK;
 }
+
+#if 0
+static int stm32l4_lock_option_reg(struct target *target)
+{
+	uint32_t ctrl;
+
+	int retval = target_read_u32(target, STM32_FLASH_CR, &ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if ((ctrl & FLASH_OPTLOCK) == (uint32_t)FLASH_OPTLOCK)
+		return ERROR_OK;
+
+	/* lock flash registers */
+	ctrl |= FLASH_OPTLOCK;
+	retval = target_write_u32(target, STM32_FLASH_CR, ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	return ERROR_OK;
+}
+#endif
 
 static int stm32l4_unlock_option_reg(struct target *target)
 {
@@ -278,30 +335,76 @@ static int stm32l4_read_options(struct flash_bank *bank)
 	if (retval != ERROR_OK)
 		return retval;
 
-	stm32l4_info->option_bytes.user_options = (optiondata >> 8) & 0x3ffff;
+	LOG_INFO("STM32_FLASH_OPTR :   %08X", optiondata);
+
+	stm32l4_info->option_bytes.user_options = (optiondata >> 8);
 	stm32l4_info->option_bytes.RDP = optiondata & 0xff;
+
+	retval = target_read_u32(target, STM32_FLASH_PCROP1SR, &optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_INFO("STM32_PCROP1SR :   %08X", optiondata);
+
+        stm32l4_info->option_bytes.pcrop1_start = optiondata;
+
+	retval = target_read_u32(target, STM32_FLASH_PCROP1ER, &optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_INFO("STM32_PCROP1ER :   %08X", optiondata);
+
+        stm32l4_info->option_bytes.pcrop1_end = optiondata;
+
+	retval = target_read_u32(target, STM32_FLASH_PCROP2SR, &optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_INFO("STM32_PCROP2SR :   %08X", optiondata);
+
+        stm32l4_info->option_bytes.pcrop2_start = optiondata;
+
+	retval = target_read_u32(target, STM32_FLASH_PCROP2ER, &optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_INFO("STM32_PCROP2ER :   %08X", optiondata);
+
+        stm32l4_info->option_bytes.pcrop2_end = optiondata;
 
 	retval = target_read_u32(target, STM32_FLASH_WRP1AR, &optiondata);
 	if (retval != ERROR_OK)
 		return retval;
+
+	LOG_INFO("STM32_FLASH_WP1AR:   %08X", optiondata);
+
 	stm32l4_info->option_bytes.wpr1a_start =  optiondata         & 0xff;
 	stm32l4_info->option_bytes.wpr1a_end   = (optiondata >> 16)  & 0xff;
 
 	retval = target_read_u32(target, STM32_FLASH_WRP2AR, &optiondata);
 	if (retval != ERROR_OK)
 		return retval;
+
+	LOG_INFO("STM32_FLASH_WP2AR:   %08X", optiondata);
+
 	stm32l4_info->option_bytes.wpr2a_start =  optiondata         & 0xff;
 	stm32l4_info->option_bytes.wpr2a_end   = (optiondata >> 16)  & 0xff;
 
 	retval = target_read_u32(target, STM32_FLASH_WRP1BR, &optiondata);
 	if (retval != ERROR_OK)
 		return retval;
+
+	LOG_INFO("STM32_FLASH_WP1BR:   %08X", optiondata);
+
 	stm32l4_info->option_bytes.wpr1b_start =  optiondata         & 0xff;
 	stm32l4_info->option_bytes.wpr1b_end   = (optiondata >> 16)  & 0xff;
 
 	retval = target_read_u32(target, STM32_FLASH_WRP2BR, &optiondata);
 	if (retval != ERROR_OK)
 		return retval;
+
+	LOG_INFO("STM32_FLASH_WP2BR:   %08X", optiondata);
+
 	stm32l4_info->option_bytes.wpr2b_start =  optiondata         & 0xff;
 	stm32l4_info->option_bytes.wpr2b_end   = (optiondata >> 16)  & 0xff;
 
@@ -322,10 +425,83 @@ static int stm32l4_write_options(struct flash_bank *bank)
 	(void) optiondata;
 	(void) stm32l4_info;
 
+	stm32l4_unlock_reg(target);
+
 	int retval = stm32l4_unlock_option_reg(target);
 	if (retval != ERROR_OK)
 		return retval;
-	/* FIXME: Implement Option writing!*/
+
+	optiondata = (((uint32_t)stm32l4_info->option_bytes.user_options) << 8);
+	optiondata |= ((uint32_t)stm32l4_info->option_bytes.RDP);
+	retval = target_write_u32(target, STM32_FLASH_OPTR, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+        optiondata = stm32l4_info->option_bytes.pcrop1_start;
+        retval = target_write_u32(target, STM32_FLASH_PCROP1SR, optiondata);
+        if (retval != ERROR_OK)
+                return retval;
+
+        optiondata = stm32l4_info->option_bytes.pcrop1_end;
+	/* Make sure device does a mass erase when moving from RDP1->RDP0 */
+	optiondata |= PCROP_RDP;
+        retval = target_write_u32(target, STM32_FLASH_PCROP1ER, optiondata);
+        if (retval != ERROR_OK)
+                return retval;
+
+        optiondata = stm32l4_info->option_bytes.pcrop2_start;
+        retval = target_write_u32(target, STM32_FLASH_PCROP2SR, optiondata);
+        if (retval != ERROR_OK)
+                return retval;
+
+        optiondata = stm32l4_info->option_bytes.pcrop2_end;
+        retval = target_write_u32(target, STM32_FLASH_PCROP2ER, optiondata);
+        if (retval != ERROR_OK)
+                return retval;
+
+	optiondata = ((uint32_t)stm32l4_info->option_bytes.wpr1a_end << 16);
+	optiondata |= ((uint32_t)stm32l4_info->option_bytes.wpr1a_start);
+	retval = target_write_u32(target, STM32_FLASH_WRP1AR, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	optiondata = ((uint32_t)stm32l4_info->option_bytes.wpr2a_end << 16);
+	optiondata |= ((uint32_t)stm32l4_info->option_bytes.wpr2a_start);
+	retval = target_write_u32(target, STM32_FLASH_WRP2AR, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	optiondata = ((uint32_t)stm32l4_info->option_bytes.wpr1b_end << 16);
+	optiondata |= ((uint32_t)stm32l4_info->option_bytes.wpr1b_start);
+	retval = target_write_u32(target, STM32_FLASH_WRP1BR, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	optiondata = ((uint32_t)stm32l4_info->option_bytes.wpr2b_end << 16);
+	optiondata |= ((uint32_t)stm32l4_info->option_bytes.wpr2b_start);
+	retval = target_write_u32(target, STM32_FLASH_WRP2BR, optiondata);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = target_write_u32(target,
+			stm32l4_get_flash_reg(bank, STM32_FLASH_CR), FLASH_OPTSTRT);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = stm32l4_wait_status_busy(bank, FLASH_ERASE_TIMEOUT);
+	if (retval != ERROR_OK)
+		return retval;
+
+//        stm32l4_lock_option_reg(target);
+
+	/* Force reset to reload options registers */
+	retval = target_write_u32(target,
+			stm32l4_get_flash_reg(bank, STM32_FLASH_CR), FLASH_OBLLAUNCH);
+	if (retval != ERROR_OK)
+		return retval;
+
+//        stm32l4_lock_reg(target);
+
 	return ERROR_OK;
 }
 
@@ -774,7 +950,7 @@ COMMAND_HANDLER(stm32l4_handle_lock_command)
 		return ERROR_OK;
 	}
 
-	/* set readout protection */
+	/* set readout protection level 1 */
 	stm32l4_info->option_bytes.RDP = 0;
 
 	if (stm32l4_write_options(bank) != ERROR_OK) {
